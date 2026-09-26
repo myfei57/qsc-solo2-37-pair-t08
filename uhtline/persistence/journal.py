@@ -97,11 +97,14 @@ class RecordJournal:
         """Replay the durable file and rebuild the visibility index."""
 
         self._records = [dict(item) for item in self.store.read_journal(self._journal)]
+        self._committed = set()
         for entry in self._records:
-            entry.pop("committed", None)
-        # Records written by an earlier build carry no commit marker, so they are
-        # taken as already committed instead of being replayed as staged work.
-        self._committed = {int(entry["sequence"]) for entry in self._records}
+            # Records written by an earlier build carry no commit marker, so they are
+            # taken as already committed instead of being replayed as staged work.
+            committed = bool(entry.get("committed", True))
+            entry["committed"] = committed
+            if committed:
+                self._committed.add(int(entry["sequence"]))
         return self.watermark(), len(self._records)
 
     def _persist(self) -> None:
@@ -128,6 +131,7 @@ class RecordJournal:
             "key": None if key is None else str(key),
             "payload": payload,
             "timestamp": self.clock.timestamp(),
+            "committed": False,
         }
         self._records.append(entry)
         self._persist()
@@ -163,9 +167,12 @@ class RecordJournal:
                 requested=target,
                 current=current,
             )
-        for entry in self._records:
-            if int(entry["sequence"]) <= target:
-                self._committed.add(int(entry["sequence"]))
+        if target > current:
+            for entry in self._records:
+                if int(entry["sequence"]) <= target:
+                    entry["committed"] = True
+                    self._committed.add(int(entry["sequence"]))
+            self._persist()
         return self.state()
 
     def rollback(self) -> int:
@@ -194,8 +201,12 @@ class RecordJournal:
         return [self._record(entry) for entry in self._records if int(entry["sequence"]) not in self._committed]
 
     def superseded_ids(self) -> set[str]:
+        """Identifiers retired by committed tombstones; staged voids do not count."""
+
         covered: set[str] = set()
         for entry in self._records:
+            if int(entry["sequence"]) not in self._committed:
+                continue
             if entry["kind"] != TOMBSTONE_KIND:
                 continue
             target = (entry.get("payload") or {}).get("target")
@@ -234,7 +245,7 @@ class RecordJournal:
             watermark=self.watermark(),
             appended=len(self._records),
             visible=len(self.visible()),
-            pending=len(self._records) - self.watermark(),
+            pending=len(self._records) - len(self._committed),
             superseded=len(self.superseded_ids()),
             committed_at=self.clock.timestamp(),
         )
