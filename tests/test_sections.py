@@ -22,9 +22,17 @@ def test_intake_receipt_is_staged_before_the_watermark_covers_it(tmp_path: Path)
     assert result["receipt"]["volume_litres"] == 700.0
     assert runtime.control.visible_records() == []
     assert [item["kind"] for item in runtime.control.pending_records()] == ["intake"]
-    assert runtime.intake.total_litres() == 700.0
+    # Unsigned receipts wait for signature: they are visible but not official.
+    assert runtime.intake.total_litres() == 0.0
+    assert runtime.intake.pending_litres() == 700.0
     assert runtime.intake.require_receipt("B-0001")["record_id"] == result["receipt"]["record_id"]
     assert runtime.intake.snapshot()["recent"][0]["volume_litres"] == 700.0
+    assert runtime.intake.snapshot()["pending_receipts"] == 1
+    # Signing promotes the staged receipt into the official production total.
+    runtime.control.commit_records()
+    assert runtime.intake.total_litres() == 700.0
+    assert runtime.intake.pending_litres() == 0.0
+    assert runtime.intake.snapshot()["receipts"] == 1
 
 
 def test_draining_the_balance_tank_lowers_the_level(tmp_path: Path) -> None:

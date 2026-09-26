@@ -149,16 +149,6 @@ def _publish_scopes(runtime: Runtime) -> None:
     runtime.flowmeter.ensure_published(reason="commissioning")
 
 
-def _reconcile_record_stream(events: RecordJournal) -> dict[str, Any]:
-    """Carry staged records forward so a restart never drops recorded work."""
-
-    staged = events.pending()
-    if not staged:
-        return {"reconciled": 0, "watermark": events.watermark()}
-    state = events.commit()
-    return {"reconciled": len(staged), "watermark": state.watermark}
-
-
 def _commission_sensors(runtime: Runtime) -> None:
     for sensor_id, position in DEFAULT_SENSORS:
         try:
@@ -181,7 +171,6 @@ def build_runtime(
     audit = AuditLedger(store, resolved_clock)
     alarms = AlarmBoard(store, resolved_clock, resolved_config, audit)
     events = RecordJournal(store, resolved_clock, EVENT_STREAM)
-    _reconcile_record_stream(events)
     generations = GenerationRegistry(store, resolved_clock)
     warranties = WarrantyBook(store, resolved_clock, generations, resolved_config.evidence)
     stages = StageMachine(store, resolved_clock, audit)

@@ -10,6 +10,7 @@ from ..errors import DuplicateError, NotFoundError, ValidationError, WatermarkEr
 from .store import DurableStore
 
 TOMBSTONE_KIND = "tombstone"
+COMMIT_FIELD = "committed"
 
 
 @dataclass(frozen=True)
@@ -94,14 +95,23 @@ class RecordJournal:
     # -- durable plumbing -------------------------------------------------
 
     def reload(self) -> tuple[int, int]:
-        """Replay the durable file and rebuild the visibility index."""
+        """Replay the durable file and rebuild the visibility index.
+
+        Commit markers are part of each durable entry: a record is committed
+        only when the operator's signature advanced the watermark over it.
+        Records written by an earlier build carry no marker, so they are taken
+        as already committed instead of being replayed as staged work.
+        """
 
         self._records = [dict(item) for item in self.store.read_journal(self._journal)]
-        for entry in self._records:
-            entry.pop("committed", None)
-        # Records written by an earlier build carry no commit marker, so they are
-        # taken as already committed instead of being replayed as staged work.
-        self._committed = {int(entry["sequence"]) for entry in self._records}
+        legacy = [entry for entry in self._records if COMMIT_FIELD not in entry]
+        for entry in legacy:
+            entry[COMMIT_FIELD] = True
+        if legacy:
+            self._persist()
+        self._committed = {
+            int(entry["sequence"]) for entry in self._records if bool(entry.get(COMMIT_FIELD))
+        }
         return self.watermark(), len(self._records)
 
     def _persist(self) -> None:
@@ -128,6 +138,7 @@ class RecordJournal:
             "key": None if key is None else str(key),
             "payload": payload,
             "timestamp": self.clock.timestamp(),
+            COMMIT_FIELD: False,
         }
         self._records.append(entry)
         self._persist()
@@ -166,6 +177,8 @@ class RecordJournal:
         for entry in self._records:
             if int(entry["sequence"]) <= target:
                 self._committed.add(int(entry["sequence"]))
+                entry[COMMIT_FIELD] = True
+        self._persist()
         return self.state()
 
     def rollback(self) -> int:
@@ -194,9 +207,13 @@ class RecordJournal:
         return [self._record(entry) for entry in self._records if int(entry["sequence"]) not in self._committed]
 
     def superseded_ids(self) -> set[str]:
+        """Record ids covered by a tombstone whose watermark has been signed."""
+
         covered: set[str] = set()
         for entry in self._records:
             if entry["kind"] != TOMBSTONE_KIND:
+                continue
+            if int(entry["sequence"]) not in self._committed:
                 continue
             target = (entry.get("payload") or {}).get("target")
             if target is not None:

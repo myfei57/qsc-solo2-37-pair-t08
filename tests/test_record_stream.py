@@ -121,3 +121,53 @@ def test_service_replays_committed_records_and_keeps_the_staged_tail_on_restart(
     assert visible.count("intake") == 1
     assert pending.count("intake") == 1
     assert second.control.stream_state()["watermark"] == 1
+
+
+def test_night_shift_restart_counts_only_signed_receipts(tmp_path: Path) -> None:
+    """Two unsubmitted receipts recorded before handoff stay pending after restart."""
+
+    night = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    night.control.start_intake(reason="night shift")
+    first = night.control.receive(500.0, 6.0, batch_id="B-N1", reason="night", key="n-1")
+    night.control.commit_records()
+    night.control.receive(600.0, 6.0, batch_id="B-N2", reason="night", key="n-2")
+    night.control.receive(400.0, 6.0, batch_id="B-N3", reason="night", key="n-3")
+
+    morning = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    assert morning.control.stream_state()["watermark"] == 1
+    assert [item.record_id for item in morning.events.visible()] == [first["staged"]["record_id"]]
+    assert morning.intake.total_litres() == 500.0
+    assert morning.intake.snapshot()["receipts"] == 1
+    assert [item["batch_id"] for item in morning.intake.pending_receipts()] == ["B-N2", "B-N3"]
+    assert morning.intake.pending_litres() == 1000.0
+
+    # The morning signature promotes the waiting tail instead of replaying it.
+    morning.control.commit_records()
+    assert morning.intake.total_litres() == 1500.0
+    assert morning.intake.pending_receipts() == []
+
+
+def test_an_unsigned_void_stays_pending_after_restart(tmp_path: Path) -> None:
+    """A tombstone recorded before handoff cannot retire its target until signed."""
+
+    night = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    night.control.start_intake(reason="night shift")
+    receipt = night.control.receive(500.0, 6.0, batch_id="B-N1", reason="night", key="n-1")
+    night.control.commit_records()
+    night.control.void_record(receipt["staged"]["record_id"], reason="paperwork error")
+
+    morning = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    target = receipt["staged"]["record_id"]
+    assert [item.record_id for item in morning.events.visible()] == [target]
+    assert morning.intake.total_litres() == 500.0
+    assert [item.kind for item in morning.events.pending()] == ["tombstone"]
+
+    # Only the signature on the void retires the receipt from production.
+    morning.control.commit_records()
+    assert morning.events.visible() == []
+    assert morning.intake.total_litres() == 0.0
+
+    settled = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    assert settled.control.stream_state()["watermark"] == 2
+    assert settled.intake.total_litres() == 0.0
+    assert settled.events.lookup(target) is not None

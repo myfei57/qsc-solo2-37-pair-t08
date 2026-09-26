@@ -157,12 +157,14 @@ class LineControl:
 
     def commit_records(self, through: int | None = None) -> dict[str, Any]:
         state = self.events.commit(through)
+        self.intake.reconcile()
         self.metrics.gauge("records.watermark", state.watermark)
         self.audit.record("records-commit", "line-events", f"watermark={state.watermark}", cause=None)
         return state.as_dict()
 
     def rollback_records(self) -> dict[str, Any]:
         discarded = self.events.rollback()
+        self.intake.reconcile()
         self.audit.record("records-rollback", "line-events", f"discarded={discarded}", cause=None)
         return {"discarded": discarded, "state": self.events.state().as_dict()}
 
